@@ -1,14 +1,13 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
-import whisper
 import os
 import uuid
+from groq import Groq
 
 app = FastAPI()
 
-# Permite CORS para o GitHub Pages
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,8 +15,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Carrega o modelo Whisper (use 'base' para economizar RAM, 'small' para melhor precisão)
-model = whisper.load_model("base")
+# A chave será injetada pelas variáveis de ambiente do Render
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 def process_download(url, format_type):
     ydl_opts = {
@@ -42,18 +42,28 @@ def download(url: str, format: str = "mp4"):
         filepath, title = process_download(url, format)
         return FileResponse(filepath, filename=f"{title}.{format}", media_type='application/octet-stream')
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/transcribe")
 def transcribe(url: str):
+    if not client:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY não configurada no servidor.")
     try:
+        # Baixa apenas o áudio para economizar RAM
         ydl_opts = {'format': 'bestaudio', 'outtmpl': f'{uuid.uuid4()}.%(ext)s'}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filepath = ydl.prepare_filename(info)
-        
-        result = model.transcribe(filepath)
+
+        # Envia para a API da Groq transcrever (Grátis e rápido)
+        with open(filepath, "rb") as file:
+            transcription = client.audio.transcriptions.create(
+                file=(filepath, file.read()),
+                model="whisper-large-v3",
+                response_format="text"
+            )
+
         os.remove(filepath)
-        return {"text": result["text"]}
+        return {"text": transcription}
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
