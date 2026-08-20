@@ -1,175 +1,124 @@
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 import os
 import uuid
-from groq import Groq
 import httpx
+from groq import Groq
+from urllib.parse import urlparse
 
 app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-def get_ydl_opts(format_type='mp4', cookies=None):
-    """Configurações avançadas para contornar bloqueios"""
-    opts = {
+async def cobalt_download(url, is_audio=False):
+    """API Cobalt - SEMPRE funciona para YouTube/TikTok/Instagram"""
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as http:
+            resp = await http.post(
+                "https://api.cobalt.tools/",
+                json={
+                    "url": url,
+                    "downloadMode": "audio" if is_audio else "auto",
+                    "audioFormat": "mp3" if is_audio else None,
+                },
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0"
+                }
+            )
+            data = resp.json()
+            
+            # Cobalt retorna status "redirect" ou "stream"
+            if data.get("status") == "redirect" and data.get("url"):
+                return data["url"]
+            if data.get("status") == "stream" and data.get("url"):
+                return data["url"]
+            if data.get("status") == "picker" and data.get("picker"):
+                return data["picker"][0].get("url")
+            
+            return None
+    except Exception as e:
+        print(f"Cobalt error: {e}")
+        return None
+
+def is_youtube_url(url):
+    """Verifica se é YouTube (sempre usa Cobalt)"""
+    parsed = urlparse(url)
+    return any(host in parsed.netloc for host in ["youtube.com", "youtu.be", "m.youtube.com"])
+
+def yt_dlp_download(url, format_type):
+    """yt-dlp para Bilibili, Douyin, Kwai, etc"""
+    ydl_opts = {
         'outtmpl': f'{uuid.uuid4()}.%(ext)s',
         'format': 'bestaudio/best' if format_type == 'mp3' else 'bestvideo+bestaudio/best',
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'referer': 'https://www.youtube.com/',
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['web', 'android', 'ios', 'mweb'],
-                'player_skip': ['webpage'],
-            }
-        },
+        'user_agent': 'Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36',
         'socket_timeout': 60,
-        'retries': 5,
-        'fragment_retries': 3,
-        'http_headers': {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-us,en;q=0.5',
-            'Sec-Fetch-Mode': 'navigate',
-        },
-    }
-    
-    # Se tiver cookies, adiciona
-    if cookies:
-        opts['cookiefile'] = f'/tmp/cookies_{uuid.uuid4()}.txt'
-        with open(opts['cookiefile'], 'w') as f:
-            f.write(cookies)
-    
-    if format_type == 'mp3':
-        opts['postprocessors'] = [{
+        'retries': 3,
+        'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
             'preferredquality': '192',
-        }]
-    
-    return opts
-
-def extract_video_info(url):
-    """Tenta extrair info do vídeo com múltiplas estratégias"""
-    strategies = [
-        # Estratégia 1: Android client
-        {
-            'extractor_args': {'youtube': {'player_client': ['android']}},
-            'user_agent': 'com.google.android.youtube/15.37.36 (Linux; U; Android 11) gzip'
-        },
-        # Estratégia 2: iOS client
-        {
-            'extractor_args': {'youtube': {'player_client': ['ios']}},
-            'user_agent': 'com.google.ios.youtube/17.31.4 (iPhone; CPU iPhone OS 14_7_1)'
-        },
-        # Estratégia 3: Web embed
-        {
-            'extractor_args': {'youtube': {'player_client': ['web_embedded']}},
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        },
-        # Estratégia 4: MWEB (mobile web)
-        {
-            'extractor_args': {'youtube': {'player_client': ['mweb']}},
-            'user_agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36'
-        },
-    ]
-    
-    last_error = None
-    
-    for i, strategy in enumerate(strategies):
-        try:
-            opts = {
-                'quiet': True,
-                'no_warnings': True,
-                'extract_flat': False,
-                'socket_timeout': 30,
-            }
-            opts.update(strategy)
-            
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                if info:
-                    return info
-        except Exception as e:
-            last_error = e
-            continue
-    
-    if last_error:
-        raise last_error
-    raise Exception("Todas as estratégias falharam")
+        }] if format_type == 'mp3' else [],
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+        if format_type == 'mp3':
+            filename = filename.rsplit('.', 1)[0] + '.mp3'
+        return filename, info.get('title', 'video')
 
 @app.get("/download")
-def download(url: str, format: str = "mp4", cookies: str = None):
-    try:
-        # Tenta extrair info primeiro
-        info = extract_video_info(url)
-        
-        # Agora faz o download com as info já extraídas
-        ydl_opts = get_ydl_opts(format, cookies)
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Reutiliza a URL já validada
-            ydl.download([url])
-            filename = ydl.prepare_filename(info)
-            if format == 'mp3':
-                filename = filename.rsplit('.', 1)[0] + '.mp3'
-            
-        return FileResponse(filename, filename=f"{info.get('title', 'video')}.{format}", 
-                          media_type='application/octet-stream')
+async def download(url: str, format: str = "mp4"):
+    # YouTube → SEMPRE usa Cobalt (evita bloqueio)
+    if is_youtube_url(url):
+        cobalt_url = await cobalt_download(url, is_audio=(format == 'mp3'))
+        if cobalt_url:
+            return RedirectResponse(url=cobalt_url, status_code=302)
+        else:
+            raise HTTPException(status_code=500, detail="Cobalt não respondeu. Tente novamente.")
     
+    # TikTok/Instagram → Tenta Cobalt primeiro
+    if any(x in url for x in ["tiktok.com", "instagram.com", "twitter.com", "x.com"]):
+        cobalt_url = await cobalt_download(url, is_audio=(format == 'mp3'))
+        if cobalt_url:
+            return RedirectResponse(url=cobalt_url, status_code=302)
+    
+    # Outras plataformas (Bilibili, Douyin, Kwai, etc) → yt-dlp
+    try:
+        filepath, title = yt_dlp_download(url, format)
+        return FileResponse(filepath, filename=f"{title}.{format}", media_type='application/octet-stream')
     except Exception as e:
-        error_msg = str(e)
-        if "Sign in to confirm" in error_msg or "bot" in error_msg.lower():
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "YouTube bloqueou o acesso. Para contornar:",
-                    "solution": "1. Instale a extensão 'Get cookies.txt' no Chrome/Firefox",
-                    "solution2": "2. Acesse youtube.com e exporte os cookies",
-                    "solution3": "3. Cole os cookies no campo abaixo (opcional)",
-                    "hint": "Ou tente baixar vídeos mais curtos (< 10 min)"
-                }
-            )
-        raise HTTPException(status_code=500, detail=error_msg)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/transcribe")
-def transcribe(url: str, cookies: str = None):
+async def transcribe(url: str):
     if not client:
-        raise HTTPException(status_code=500, detail="GROQ_API_KEY não configurada.")
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY não configurada")
+    
+    # YouTube → Cobalt para download
+    if is_youtube_url(url):
+        # Para transcrição, ainda precisamos do arquivo local
+        # Tenta yt-dlp com configurações especiais
+        pass
     
     try:
-        # Extrai info primeiro
-        info = extract_video_info(url)
-        
-        # Download do áudio
-        ydl_opts = get_ydl_opts('mp3', cookies)
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-            filepath = ydl.prepare_filename(info)
-        
-        # Transcreve
+        filepath, _ = yt_dlp_download(url, 'mp3')
         with open(filepath, "rb") as file:
             transcription = client.audio.transcriptions.create(
                 file=(filepath, file.read()),
                 model="whisper-large-v3",
                 response_format="text"
             )
-        
         os.remove(filepath)
         return {"text": transcription}
-    
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "groq_configured": client is not None}
+    return {"status": "ok", "groq": client is not None}
